@@ -1,84 +1,47 @@
 import endent from 'endent';
-import OpenAI from "openai";
+import { GoogleGenerativeAI, HarmCategory, HarmBlockThreshold, SchemaType, FunctionCallingMode } from "@google/generative-ai";
 import { readMarkdownFiles } from './download';
-import { zodFunction } from 'openai/helpers/zod';
-import { z } from 'zod';
 
-const openai = new OpenAI();
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY || "");
 
-async function shouldAnswer(question: string, content: string) {
-  const prompt = getPrompt(question, content);
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
-      {
-        role: "system",
-        content: "You are a assistant that answers questions based on the provided documents. Be very concise in your response."
-      },
-      {
-        role: "user",
-        content: prompt
-      },
-    ],
-    tool_choice: {
-      "type": "function",
-      "function": {
-        "name": "submitIsAnswerable"
-      }
-    },
-    tools: [
-      zodFunction({ name: "submitIsAnswerable", parameters: SubmitIsAnswerableSchema }),
-    ],
-  });
-
-  console.log(JSON.stringify(completion.choices[0] ?? '', null, 2));
-
-  const { isAnswerable } = JSON.parse(completion.choices[0]?.message.tool_calls?.[0]?.function.arguments ?? '{}') as SubmitIsAnswerable;
-
-  return isAnswerable;
-}
+const CANNOT_ANSWER_SENTINEL = "[CANNOT_ANSWER]";
 
 // Construct a prompt that combines the question with the document content
 function getPrompt(question: string, content: string) {
+  console.time("getPromptLogic");
   const prompt = endent`
     <documents>
     ${content}
     </documents>
 
-    Please provide a clear, accurate answer to the user's question based only on the information in the documents above. Follow the below instructions.
+    Please provide a clear, accurate answer to the user's question based only on the information in the documents above. Follow the below instructions CAREFULLY.
     
     Instructions:
     - Provide very concise answers. 
-    - Always respond with phrase and link to the relevant document.
-    - Do not speculate or make up information. If you do not know the answer, say so politely.
+    - Always respond with phrase and link to the relevant document if possible.
+    - Do not speculate or make up information. 
+    - If you cannot answer the question based *only* on the provided documents, you MUST start your response *exactly* with the phrase: ${CANNOT_ANSWER_SENTINEL}
+    - If you can answer, provide the answer directly without the ${CANNOT_ANSWER_SENTINEL} phrase.
 
-    Example:
+    Example of unanswerable question response:
+    ${CANNOT_ANSWER_SENTINEL} I cannot find information about the color of the sky in the documents.
 
-    <example_user_question>
-    How can I get a role?
-    </example_user_question>
-
-    <example_assistant_response>
-    Please check the [roles documentation](https://docs.inference.supply/discord-roles)
-    </example_assistant_response>
+    Example of answerable question response:
+    Please check the [roles documentation](https://docs.inference.supply/discord-roles) for how to get a role.
     ----------------
 
     <user_question>
     ${question}
     </user_question>
   `;
-
+  console.timeEnd("getPromptLogic");
   return prompt;
 }
 
-const SubmitIsAnswerableSchema = z.object({
-  isAnswerable: z.boolean().describe("Whether the question can be answered based on the documents"),
-});
-
-type SubmitIsAnswerable = z.infer<typeof SubmitIsAnswerableSchema>;
-
 export async function ask(question: string): Promise<string | null> {
+  console.time("totalAskFunction");
+
+  console.time("readAndMapFiles");
   const files = await readMarkdownFiles();
   const mappedFiles = files.map(file =>
     endent`
@@ -86,34 +49,50 @@ export async function ask(question: string): Promise<string | null> {
       CONTENT: ${file.content}
     `
   ).join('\n\n');
-
+  console.timeEnd("readAndMapFiles");
 
   const prompt = getPrompt(question, mappedFiles);
 
-  const shouldRespond = await shouldAnswer(question, mappedFiles);
-
-  if (!shouldRespond) {
-    console.log('Not answering question:', question);
-    return null;
-  }
-
-  const completion = await openai.chat.completions.create({
-    model: "gpt-4o-mini",
-    messages: [
+  console.time("geminiApiCall");
+  const model = genAI.getGenerativeModel({
+    model: "gemini-2.0-flash", 
+    safetySettings: [
       {
-        role: "system",
-        content: "You are a assistant that answers questions based on the provided documents. Be very concise in your response."
+        category: HarmCategory.HARM_CATEGORY_HARASSMENT,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
       },
       {
-        role: "user",
-        content: prompt
+        category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+      },
+      {
+        category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
+      },
+      {
+        category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
+        threshold: HarmBlockThreshold.BLOCK_MEDIUM_AND_ABOVE,
       },
     ],
+    // No tools needed for this simpler approach
   });
 
+  const result = await model.generateContent({
+    contents: [{ role: "user", parts: [{ text: prompt }] }],
+  });
+  console.timeEnd("geminiApiCall");
 
-  const answer = completion.choices[0]?.message.content || '';
+  const response = result.response;
+  let answer = response.text();
 
-  return answer;
+  if (answer.startsWith(CANNOT_ANSWER_SENTINEL)) {
+    console.log("Model indicated it cannot answer the question based on documents.");
+    const genericResponse = "I can only answer questions based on the information available in the provided documents. I couldn't find an answer to your question there.";
+    console.timeEnd("totalAskFunction");
+    return genericResponse; // Return the generic response string
+  }
+
+  console.timeEnd("totalAskFunction");
+  return answer.trim(); // Trim any leading/trailing whitespace
 }
 
